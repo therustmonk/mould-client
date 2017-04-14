@@ -1,0 +1,12 @@
+[package]
+name = "mould-client"
+version = "0.1.0"
+authors = ["Denis Kolodin <deniskolodin@gmail.com>"]
+
+[dependencies]
+log = "0.3.7"
+error-chain = "0.10.0"
+websocket = "0.19.1"
+serde = "0.9.13"
+serde_derive = "0.9.13"
+serde_json = "0.9.10"
