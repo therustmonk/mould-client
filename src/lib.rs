@@ -2,8 +2,17 @@
 #[macro_use] extern crate error_chain;
 extern crate serde;
 #[macro_use] extern crate serde_derive;
-extern crate serde_json;
-extern crate websocket;
+pub extern crate serde_json;
+pub extern crate websocket;
+extern crate futures;
+extern crate futures_state_stream;
+extern crate tokio_core;
+extern crate tokio_io;
+extern crate tungstenite;
+extern crate tokio_tungstenite;
+extern crate url;
+
+pub mod async;
 
 use std::fmt;
 use std::str;
@@ -19,6 +28,7 @@ error_chain! {
         EncodingError(str::Utf8Error);
         SerdeError(serde_json::Error);
         WebSocketError(websocket::result::WebSocketError);
+        AsycWebSocketError(tungstenite::Error);
     }
     errors {
         InteractionFinished {
@@ -49,9 +59,27 @@ error_chain! {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Event {
-    event: EventKind,
-    data: Option<Value>,
+pub struct Event {
+    pub event: EventKind,
+    pub data: Option<Value>,
+}
+
+impl Event {
+    pub fn is_terminated(&self) -> bool {
+        use EventKind::*;
+        match self.event {
+            Done | Fail | Reject => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        use EventKind::*;
+        match self.event {
+            Ready => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
