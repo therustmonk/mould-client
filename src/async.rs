@@ -1,13 +1,14 @@
+use std::marker::PhantomData;
 use serde_json;
 use url::Url;
+use serde::de::Deserialize;
 use serde_json::Value;
 use serde_json::value::ToJson;
 use futures::{future, Future, Async, AsyncSink, Poll, Stream, Sink, StartSend, BoxFuture};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tungstenite::Message;
 use tokio_tungstenite::{client_async, ConnectAsync, WebSocketStream};
-use super::{Event, EventKind, Error, ErrorKind, InteractionRequest};
-//use futures_state_stream::{unfold, StateStream, StreamExt};
+use super::{Event, EventKind, Error, ErrorKind, InteractionRequest, Request};
 
 pub fn mould_connect<S: AsyncRead + AsyncWrite>(url: Url, stream: S) -> Connecting<S> {
     Connecting {
@@ -26,7 +27,8 @@ impl<S: AsyncRead + AsyncWrite> Future for Connecting<S> {
     fn poll(&mut self) -> Poll<MouldTransport<S>, Error> {
         self.inner.poll().map(|async| {
             async.map(MouldTransport::new)
-        }).map_err(Error::from)
+        })
+        .map_err(Error::from)
     }
 }
 
@@ -84,9 +86,7 @@ impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
     }
 }
 
-pub struct MouldClient<T>(MouldTransport<T>);
-
-impl<T> MouldClient<T> where T: AsyncRead + AsyncWrite + Send + 'static {
+impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
     pub fn start_interaction(self, request: InteractionRequest) -> BoxFuture<Self, Error> {
         let event = future::lazy(move || {
             let event = Event {
@@ -96,19 +96,68 @@ impl<T> MouldClient<T> where T: AsyncRead + AsyncWrite + Send + 'static {
             Ok(event)
         });
         event.and_then(move |event| {
-            self.0.send(event)
+            self.send(event)
         })
-        .map(MouldClient)
         .boxed()
     }
 
+    pub fn till_end(self) -> BoxFuture<Self, Error> {
+        self.into_future()
+            .map_err(|e| e.0)
+            .and_then(|(event, mould)| {
+                if let Some(Event { event, data }) = event {
+                    match event {
+                        EventKind::Done => {
+                            Ok(mould)
+                        },
+                        EventKind::Reject => {
+                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
+                            Err(ErrorKind::ActionRejected(reason.into()).into())
+                        },
+                        EventKind::Fail => {
+                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
+                            Err(ErrorKind::ActionFailed(reason.into()).into())
+                        },
+                        kind => {
+                            return Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into());
+                        },
+                    }
+                } else {
+                    Err(ErrorKind::Interrupted.into())
+                }
+            })
+            .boxed()
+    }
+
+    pub fn ready_next(self) -> BoxFuture<Self, Error> {
+        self.into_future()
+            .map_err(|e| e.0)
+            .and_then(|(evt, mould)| {
+                match evt {
+                    Some(Event { event: EventKind::Ready, .. }) => {
+                        mould.send(Event::empty(EventKind::Next))
+                            .boxed()
+                    },
+                    Some(event) => {
+                        future::err(ErrorKind::UnexpectedKind(format!("{:?}", event.event)).into())
+                            .boxed()
+                    },
+                    None => {
+                        future::err(ErrorKind::Interrupted.into())
+                            .boxed()
+                    },
+                }
+            })
+            .boxed()
+    }
+
     pub fn recv_item(self) -> BoxFuture<(Value, Self), Error> {
-        self.0.into_future()
+        self.into_future()
             .map_err(|e| e.0)
             .and_then(|(evt, mould)| {
                 match evt {
                     Some(Event { event: EventKind::Item, data: Some(value) }) => {
-                        Ok((value, MouldClient(mould)))
+                        Ok((value, mould))
                     },
                     Some(event) => {
                         Err(ErrorKind::UnexpectedKind(format!("{:?}", event.event)).into())
@@ -120,100 +169,96 @@ impl<T> MouldClient<T> where T: AsyncRead + AsyncWrite + Send + 'static {
             })
             .boxed()
     }
+}
 
-    /*
-    pub fn till_end(self) -> BoxFuture<Self, Error> {
-        unfold(self.0, |c| {
-            let (sink, stream) = c.split();
-            stream.take_while(|event| Ok(event.is_terminated()))
-                .filter(Event::is_ready)
-                .map(|_| {
-                    Event {
-                        event: EventKind::Next,
-                        data: None,
-                    }
-                })
-                .forward(sink)
-        }).boxed()
+pub struct ItemsFlow<S, A, T> {
+    stream: S,
+    answers: A,
+    what: PhantomData<T>,
+}
+
+impl<S, A, T> ItemsFlow<S, A, T>
+    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+          A: Stream<Item=Option<Request>, Error=Error>,
+{
+    pub fn new(s: S, a: A) -> Self {
+        ItemsFlow {
+            stream: s,
+            answers: a,
+            what: PhantomData,
+        }
     }
-    */
+}
 
-    /*
-    pub fn till_end(self) -> BoxFuture<Self, Error> {
-        let (sink, stream) = self.split();
-        self.take_while(|event| Ok(event.is_terminated()))
-            .into_future()
-            .map_err(|e| e.0)
-            .and_then(|t| Ok(t.1))
-            .boxed()
-            .into_future()
-            /*
-            .filter(Event::is_ready)
-            .map(|_| {
-                Event {
+impl<S, A, T> Stream for ItemsFlow<S, A, T>
+    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+          A: Stream<Item=Option<Request>, Error=Error>,
+          T: Deserialize,
+{
+    type Item = T;
+    type Error = S::Error;
+
+    fn poll(&mut self) -> Poll<Option<T>, S::Error> {
+        let result = match self.stream.poll() {
+            Ok(Async::Ready(Some(Event { event, data }))) => {
+                match event {
+                    EventKind::Item => {
+                        if let Some(data) = data {
+                            let res = serde_json::from_value(data);
+                            if let Ok(res) = res {
+                                Ok(Async::Ready(Some(res)))
+                            } else {
+                                Err(ErrorKind::UnexpectedFormat.into())
+                            }
+                        } else {
+                            Err(ErrorKind::NoDataProvided.into())
+                        }
+                    },
+                    EventKind::Reject => {
+                        let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
+                        Err(ErrorKind::ActionRejected(reason.into()).into())
+                    },
+                    EventKind::Fail => {
+                        let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
+                        Err(ErrorKind::ActionFailed(reason.into()).into())
+                    },
+                    EventKind::Ready => {
+                        Ok(Async::NotReady)
+                    },
+                    EventKind::Done => {
+                        Ok(Async::Ready(None))
+                    },
+                    kind => {
+                        Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into())
+                    },
+                }
+            },
+            Ok(Async::Ready(None)) => {
+                Ok(Async::Ready(None))
+            },
+            Ok(Async::NotReady) => {
+                Ok(Async::NotReady)
+            },
+            Err(e) => {
+                Err(e.into())
+            },
+        };
+        if let Ok(Async::NotReady) = result {
+            if let Async::Ready(Some(request)) = self.answers.poll()? {
+                let value = match request {
+                    Some(request) => Some(request.to_json()?),
+                    None => None,
+                };
+                let event = Event {
                     event: EventKind::Next,
-                    data: None,
-                }
-            })
-            .forward(sink)
-            .map(|t| t.0)
-            .boxed()
-            */
-        /*
-            .map(|event| event.data)
-            .filter(|data| data.is_some())
-            .map(Option::unwrap)
-            .collect()
-            .into_stream()
-            .into_future()
-            .map_err(|e| e.0)
-            .and_then(|t| t.1)
-            .boxed();
-        fut
-        */
-            /*
-            .and_then(|(vec, mould)| {
-                if let Some(vec) = vec {
-                    return mould.and_then(|mould| {
-                        Ok((vec, mould))
-                    }).boxed();
-                } else {
-                    return future::err(Err(ErrorKind::Interrupted.into())).boxed();
-                }
-            }).boxed()
-            */
-            /*
-            .and_then(|(vec, mould)| {
-                mould.and_then(|mould| {
-                    if let Some(vec) = vec {
-                        Ok((vec, mould))
-                    } else {
-                        Err(ErrorKind::Interrupted.into())
-                    }
-                })
-            })
-            */
+                    data: value,
+                };
+                self.stream.start_send(event)?;
+            }
+            Ok(Async::NotReady)
+        } else {
+            result
+        }
     }
-    */
 }
 
-/*
-impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
-    pub fn one_shot(self, request: InteractionRequest) -> BoxFuture<Self, Error> {
-        let event = future::lazy(move || {
-            let event = Event {
-                event: EventKind::Request,
-                data: Some(request.to_json()?),
-            };
-            Ok(event)
-        });
-        let send_req = event.and_then(|event| {
-            self.send(event)
-        });
-        let wait_done = send_req.and_then(|mould| {
-            mould.take_while(|e| future::ok(e.is_terminated())).collect().fuse()
-        });
-        wait_done.boxed()
-    }
-}
-*/

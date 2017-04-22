@@ -14,9 +14,7 @@ extern crate url;
 
 pub mod async;
 
-use std::fmt;
-use std::str;
-use std::result;
+use std::{fmt, io, str, result};
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
 use serde::de::{Visitor};
 use serde_json::{Map, Value};
@@ -25,6 +23,7 @@ use websocket::message::{Message, Type};
 
 error_chain! {
     foreign_links {
+        IoError(io::Error);
         EncodingError(str::Utf8Error);
         SerdeError(serde_json::Error);
         WebSocketError(websocket::result::WebSocketError);
@@ -55,6 +54,10 @@ error_chain! {
         NoDataProvided {
             description("no data provided")
         }
+        Other(s: String) {
+            description("other error")
+            display("other error: '{}'", s)
+        }
     }
 }
 
@@ -78,6 +81,13 @@ impl Event {
         match self.event {
             Ready => true,
             _ => false,
+        }
+    }
+
+    pub fn empty(kind: EventKind) -> Self {
+        Event {
+            event: kind,
+            data: None,
         }
     }
 }
@@ -135,6 +145,7 @@ impl Deserialize for EventKind {
                 let kind = match value {
                     "request" => EventKind::Request,
                     "ready" => EventKind::Ready,
+                    "item" => EventKind::Item,
                     "next" => EventKind::Next,
                     "reject" => EventKind::Reject,
                     "fail" => EventKind::Fail,
@@ -296,7 +307,6 @@ impl<S> BusyClient<S>
     }
 
 }
-
 
 #[cfg(test)]
 mod test {
