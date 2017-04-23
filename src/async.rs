@@ -171,13 +171,29 @@ impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
     }
 }
 
-pub struct ItemsFlow<S, A, T> {
-    stream: S,
-    answers: A,
-    what: PhantomData<T>,
+pub trait MouldStream {
+    fn items_flow<T, A>(self, answers: A) -> ItemsFlow<T, Self, A>
+        where T: Deserialize,
+              A: Stream<Item=Option<Request>, Error=Error>,
+              Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+
+    {
+        ItemsFlow::new(self, answers)
+    }
 }
 
-impl<S, A, T> ItemsFlow<S, A, T>
+impl<S> MouldStream for S
+    where S: Stream<Item=Event, Error=Error>
+{
+}
+
+pub struct ItemsFlow<T, S, A> {
+    what: PhantomData<T>,
+    stream: S,
+    answers: A,
+}
+
+impl<T, S, A> ItemsFlow<T, S, A>
     where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
           A: Stream<Item=Option<Request>, Error=Error>,
 {
@@ -190,7 +206,7 @@ impl<S, A, T> ItemsFlow<S, A, T>
     }
 }
 
-impl<S, A, T> Stream for ItemsFlow<S, A, T>
+impl<T, S, A> Stream for ItemsFlow<T, S, A>
     where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
           A: Stream<Item=Option<Request>, Error=Error>,
           T: Deserialize,
