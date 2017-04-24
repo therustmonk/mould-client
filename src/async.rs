@@ -173,18 +173,97 @@ impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
 
 pub trait MouldStream {
     fn items_flow<T, A>(self, answers: A) -> ItemsFlow<T, Self, A>
-        where T: Deserialize,
+        where Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
               A: Stream<Item=Option<Request>, Error=Error>,
-              Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+              T: Deserialize
 
     {
         ItemsFlow::new(self, answers)
+    }
+
+    fn send_request<T>(self, initiatior: InteractionRequest) -> TillDone<T, Self>
+        where Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+    {
+        TillDone::new(self, initiatior)
     }
 }
 
 impl<S> MouldStream for S
     where S: Stream<Item=Event, Error=Error>
 {
+}
+
+pub struct TillDone<T, S> {
+    value: Option<T>,
+    stream: Option<S>,
+    initiator: Option<InteractionRequest>,
+}
+
+impl<T, S> TillDone<T, S>
+    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+{
+    pub fn new(s: S, i: InteractionRequest) -> Self {
+        TillDone {
+            value: None,
+            stream: Some(s),
+            initiator: Some(i),
+        }
+    }
+}
+
+impl<T, S> Future for TillDone<T, S>
+    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+          T: Deserialize
+{
+    type Item = (Option<T>, S);
+    type Error = (S::Error, S);
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let result = {
+            if let Some(inititator) = self.initiator.take() {
+                match inititator.to_json() {
+                    Ok(request) => {
+                        let event = Event {
+                            event: EventKind::Request,
+                            data: Some(request),
+                        };
+                        let stream = self.stream.as_mut().expect("polling TillDone twice");
+                        stream.start_send(event).map_err(Error::from).map(|_| Async::NotReady)
+                    },
+                    Err(err) => {
+                        Err(err.into())
+                    },
+                }
+            } else {
+                let stream = self.stream.as_mut().expect("polling TillDone twice");
+                match transform(stream.poll()) {
+                    Ok(Async::Ready(Some(value))) => {
+                        self.value = Some(value);
+                        // We have to wait till `done` event
+                        Ok(Async::NotReady)
+                    },
+                    Ok(Async::Ready(None)) => {
+                        Ok(Async::Ready(self.value.take()))
+                    },
+                    err => {
+                        err
+                    },
+                }
+            }
+        };
+        match result {
+            Ok(async) => {
+                Ok(async.map(|value| {
+                    let stream = self.stream.take().unwrap();
+                    (value, stream)
+                }))
+            },
+            Err(err) => {
+                let stream = self.stream.take().unwrap();
+                Err((err, stream))
+            },
+        }
+    }
 }
 
 pub struct ItemsFlow<T, S, A> {
@@ -199,9 +278,9 @@ impl<T, S, A> ItemsFlow<T, S, A>
 {
     pub fn new(s: S, a: A) -> Self {
         ItemsFlow {
+            what: PhantomData,
             stream: s,
             answers: a,
-            what: PhantomData,
         }
     }
 }
@@ -215,50 +294,7 @@ impl<T, S, A> Stream for ItemsFlow<T, S, A>
     type Error = S::Error;
 
     fn poll(&mut self) -> Poll<Option<T>, S::Error> {
-        let result = match self.stream.poll() {
-            Ok(Async::Ready(Some(Event { event, data }))) => {
-                match event {
-                    EventKind::Item => {
-                        if let Some(data) = data {
-                            let res = serde_json::from_value(data);
-                            if let Ok(res) = res {
-                                Ok(Async::Ready(Some(res)))
-                            } else {
-                                Err(ErrorKind::UnexpectedFormat.into())
-                            }
-                        } else {
-                            Err(ErrorKind::NoDataProvided.into())
-                        }
-                    },
-                    EventKind::Reject => {
-                        let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
-                        Err(ErrorKind::ActionRejected(reason.into()).into())
-                    },
-                    EventKind::Fail => {
-                        let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
-                        Err(ErrorKind::ActionFailed(reason.into()).into())
-                    },
-                    EventKind::Ready => {
-                        Ok(Async::NotReady)
-                    },
-                    EventKind::Done => {
-                        Ok(Async::Ready(None))
-                    },
-                    kind => {
-                        Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into())
-                    },
-                }
-            },
-            Ok(Async::Ready(None)) => {
-                Ok(Async::Ready(None))
-            },
-            Ok(Async::NotReady) => {
-                Ok(Async::NotReady)
-            },
-            Err(e) => {
-                Err(e.into())
-            },
-        };
+        let result = transform(self.stream.poll());
         if let Ok(Async::NotReady) = result {
             if let Async::Ready(Some(request)) = self.answers.poll()? {
                 let value = match request {
@@ -278,3 +314,50 @@ impl<T, S, A> Stream for ItemsFlow<T, S, A>
     }
 }
 
+
+fn transform<T: Deserialize>(result: Result<Async<Option<Event>>, Error>) -> Result<Async<Option<T>>, Error> {
+    match result {
+        Ok(Async::Ready(Some(Event { event, data }))) => {
+            match event {
+                EventKind::Item => {
+                    if let Some(data) = data {
+                        let res = serde_json::from_value(data);
+                        if let Ok(res) = res {
+                            Ok(Async::Ready(Some(res)))
+                        } else {
+                            Err(ErrorKind::UnexpectedFormat.into())
+                        }
+                    } else {
+                        Err(ErrorKind::NoDataProvided.into())
+                    }
+                },
+                EventKind::Reject => {
+                    let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
+                    Err(ErrorKind::ActionRejected(reason.into()).into())
+                },
+                EventKind::Fail => {
+                    let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
+                    Err(ErrorKind::ActionFailed(reason.into()).into())
+                },
+                EventKind::Ready => {
+                    Ok(Async::NotReady)
+                },
+                EventKind::Done => {
+                    Ok(Async::Ready(None))
+                },
+                kind => {
+                    Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into())
+                },
+            }
+        },
+        Ok(Async::Ready(None)) => {
+            Ok(Async::Ready(None))
+        },
+        Ok(Async::NotReady) => {
+            Ok(Async::NotReady)
+        },
+        Err(e) => {
+            Err(e.into())
+        },
+    }
+}
