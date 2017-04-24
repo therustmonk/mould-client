@@ -61,7 +61,7 @@ error_chain! {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Event {
     pub event: EventKind,
     pub data: Option<Value>,

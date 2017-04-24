@@ -4,7 +4,7 @@ use url::Url;
 use serde::de::Deserialize;
 use serde_json::Value;
 use serde_json::value::ToJson;
-use futures::{future, Future, Async, AsyncSink, Poll, Stream, Sink, StartSend, BoxFuture};
+use futures::{future, Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSend, BoxFuture};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tungstenite::Message;
 use tokio_tungstenite::{client_async, ConnectAsync, WebSocketStream};
@@ -87,6 +87,7 @@ impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
 }
 
 impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
+    /*
     pub fn start_interaction(self, request: InteractionRequest) -> BoxFuture<Self, Error> {
         let event = future::lazy(move || {
             let event = Event {
@@ -128,6 +129,7 @@ impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
             })
             .boxed()
     }
+    */
 
     pub fn ready_next(self) -> BoxFuture<Self, Error> {
         self.into_future()
@@ -181,32 +183,92 @@ pub trait MouldStream {
         ItemsFlow::new(self, answers)
     }
 
-    fn send_request<T>(self, initiatior: InteractionRequest) -> TillDone<T, Self>
+    fn start_interaction(self, initiatior: InteractionRequest) -> StartInteraction<Self>
         where Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
     {
-        TillDone::new(self, initiatior)
+        StartInteraction::new(self, initiatior)
     }
+
+    fn till_done<T>(self) -> TillDone<T, Self>
+        where Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+    {
+        TillDone::new(self)
+    }
+
 }
 
 impl<S> MouldStream for S
-    where S: Stream<Item=Event, Error=Error>
+    where S: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
 {
+}
+
+pub struct StartInteraction<S> {
+    request: Option<InteractionRequest>,
+    stream: Option<S>,
+}
+
+impl<S> StartInteraction<S> {
+    pub fn new(s: S, i: InteractionRequest) -> Self {
+        StartInteraction {
+            request: Some(i),
+            stream: Some(s),
+        }
+    }
+}
+
+impl<S> Future for StartInteraction<S>
+    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+{
+    type Item = S;
+    type Error = (S::SinkError, S);
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        if let Some(request) = self.request.take() {
+            match request.to_json() {
+                Ok(request) => {
+                    let event = Event {
+                        event: EventKind::Request,
+                        data: Some(request),
+                    };
+                    let sending = self.stream.as_mut().expect("polling StartInteraction twice").start_send(event);
+                    if let Err(err) = sending {
+                        let stream = self.stream.take().unwrap();
+                        return Err((err, stream));
+                    }
+                },
+                Err(err) => {
+                    let stream = self.stream.take().unwrap();
+                    return Err((err.into(), stream));
+                },
+            }
+        }
+        let evt = self.stream.as_mut().expect("polling StartInteraction twice").poll();
+        match transform::<Value>(evt) {
+            Ok(Async::Ready(_)) => {
+                let stream = self.stream.take().unwrap();
+                Ok(Async::Ready(stream))
+            },
+            Ok(Async::NotReady) => {
+                Ok(Async::NotReady)
+            },
+            Err(err) => {
+                let stream = self.stream.take().unwrap();
+                Err((err, stream))
+            },
+        }
+    }
 }
 
 pub struct TillDone<T, S> {
     value: Option<T>,
     stream: Option<S>,
-    initiator: Option<InteractionRequest>,
 }
 
-impl<T, S> TillDone<T, S>
-    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
-{
-    pub fn new(s: S, i: InteractionRequest) -> Self {
+impl<T, S> TillDone<T, S> {
+    pub fn new(s: S) -> Self {
         TillDone {
             value: None,
             stream: Some(s),
-            initiator: Some(i),
         }
     }
 }
@@ -215,48 +277,42 @@ impl<T, S> Future for TillDone<T, S>
     where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
           T: Deserialize
 {
+    // TODO User Item = (Result<T, MouldReason>, S);
     type Item = (Option<T>, S);
     type Error = (S::Error, S);
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let result = {
-            if let Some(inititator) = self.initiator.take() {
-                match inititator.to_json() {
-                    Ok(request) => {
-                        let event = Event {
-                            event: EventKind::Request,
-                            data: Some(request),
-                        };
-                        let stream = self.stream.as_mut().expect("polling TillDone twice");
-                        stream.start_send(event).map_err(Error::from).map(|_| Async::NotReady)
-                    },
-                    Err(err) => {
-                        Err(err.into())
-                    },
-                }
-            } else {
-                let stream = self.stream.as_mut().expect("polling TillDone twice");
-                match transform(stream.poll()) {
-                    Ok(Async::Ready(Some(value))) => {
-                        self.value = Some(value);
-                        // We have to wait till `done` event
+        let event = self.stream.as_mut().expect("polling TillDone twice").poll();
+        match transform(event) {
+            Ok(Async::Ready(Some(Ready::Item(value)))) => {
+                self.value = Some(value);
+                // We have to wait till `done` event
+                Ok(Async::NotReady)
+            },
+            Ok(Async::Ready(Some(Ready::NeedNext))) => {
+                let event = Event {
+                    event: EventKind::Next,
+                    data: None,
+                };
+                let res = self.stream.as_mut().expect("polling TillDone twice").start_send(event);
+                match res {
+                    Ok(_) => {
                         Ok(Async::NotReady)
                     },
-                    Ok(Async::Ready(None)) => {
-                        Ok(Async::Ready(self.value.take()))
-                    },
-                    err => {
-                        err
+                    Err(err) => {
+                        // TODO Consider to send `cancel` event
+                        let stream = self.stream.take().unwrap();
+                        Err((err, stream))
                     },
                 }
-            }
-        };
-        match result {
-            Ok(async) => {
-                Ok(async.map(|value| {
-                    let stream = self.stream.take().unwrap();
-                    (value, stream)
-                }))
+            },
+            Ok(Async::Ready(None)) => {
+                let stream = self.stream.take().unwrap();
+                let value = self.value.take();
+                Ok(Async::Ready((value, stream)))
+            },
+            Ok(Async::NotReady) => {
+                Ok(Async::NotReady)
             },
             Err(err) => {
                 let stream = self.stream.take().unwrap();
@@ -295,27 +351,38 @@ impl<T, S, A> Stream for ItemsFlow<T, S, A>
 
     fn poll(&mut self) -> Poll<Option<T>, S::Error> {
         let result = transform(self.stream.poll());
-        if let Ok(Async::NotReady) = result {
-            if let Async::Ready(Some(request)) = self.answers.poll()? {
-                let value = match request {
-                    Some(request) => Some(request.to_json()?),
-                    None => None,
-                };
-                let event = Event {
-                    event: EventKind::Next,
-                    data: value,
-                };
-                self.stream.start_send(event)?;
-            }
-            Ok(Async::NotReady)
-        } else {
-            result
+        match result {
+            Ok(Async::NotReady) | Ok(Async::Ready(Some(Ready::NeedNext))) => {
+                if let Async::Ready(Some(request)) = self.answers.poll()? {
+                    let value = request.to_json()?;
+                    let event = Event {
+                        event: EventKind::Next,
+                        data: Some(value),
+                    };
+                    self.stream.start_send(event)?;
+                }
+                Ok(Async::NotReady)
+            },
+            Ok(Async::Ready(Some(Ready::Item(item)))) => {
+                Ok(Async::Ready(Some(item)))
+            },
+            Ok(Async::Ready(None)) => {
+                Ok(Async::Ready(None))
+            },
+            Err(err) => {
+                Err(err)
+            },
         }
     }
 }
 
+enum Ready<T> {
+    Item(T),
+    NeedNext,
+}
 
-fn transform<T: Deserialize>(result: Result<Async<Option<Event>>, Error>) -> Result<Async<Option<T>>, Error> {
+fn transform<T: Deserialize>(result: Result<Async<Option<Event>>, Error>)
+    -> Result<Async<Option<Ready<T>>>, Error> {
     match result {
         Ok(Async::Ready(Some(Event { event, data }))) => {
             match event {
@@ -323,7 +390,7 @@ fn transform<T: Deserialize>(result: Result<Async<Option<Event>>, Error>) -> Res
                     if let Some(data) = data {
                         let res = serde_json::from_value(data);
                         if let Ok(res) = res {
-                            Ok(Async::Ready(Some(res)))
+                            Ok(Async::Ready(Some(Ready::Item(res))))
                         } else {
                             Err(ErrorKind::UnexpectedFormat.into())
                         }
@@ -340,7 +407,7 @@ fn transform<T: Deserialize>(result: Result<Async<Option<Event>>, Error>) -> Res
                     Err(ErrorKind::ActionFailed(reason.into()).into())
                 },
                 EventKind::Ready => {
-                    Ok(Async::NotReady)
+                    Ok(Async::Ready(Some(Ready::NeedNext)))
                 },
                 EventKind::Done => {
                     Ok(Async::Ready(None))
@@ -361,3 +428,41 @@ fn transform<T: Deserialize>(result: Result<Async<Option<Event>>, Error>) -> Res
         },
     }
 }
+
+pub trait Companion {
+    fn stright(self) -> Stright<Self>
+        where Self: Sized + IntoFuture
+    {
+        Stright::new(self)
+    }
+}
+
+impl<F> Companion for F
+    where F: Future
+{
+}
+
+pub struct Stright<S> {
+    inner: S,
+}
+
+impl<S> Stright<S> {
+    pub fn new(s: S) -> Self {
+        Stright {
+            inner: s,
+        }
+    }
+}
+
+impl<S, L, R> Future for Stright<S>
+    where S: Future<Error=(L, R)>
+{
+    type Item = S::Item;
+    type Error = L;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let evt = self.inner.poll();
+        evt.map_err(|(l, _)| l)
+    }
+}
+
