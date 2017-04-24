@@ -175,6 +175,7 @@ impl<S> Future for StartInteraction<S>
 pub struct TillDone<T, S> {
     value: Option<T>,
     stream: Option<S>,
+    first_next: bool,
 }
 
 impl<T, S> TillDone<T, S> {
@@ -182,6 +183,7 @@ impl<T, S> TillDone<T, S> {
         TillDone {
             value: None,
             stream: Some(s),
+            first_next: true,
         }
     }
 }
@@ -195,6 +197,19 @@ impl<T, S> Future for TillDone<T, S>
     type Error = (S::Error, S);
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        if self.first_next {
+            self.first_next = false;
+            let event = Event {
+                event: EventKind::Next,
+                data: None,
+            };
+            let res = self.stream.as_mut().expect("polling TillDone twice").start_send(event);
+            if let Err(err) = res {
+                // TODO Consider to send `cancel` event
+                let stream = self.stream.take().unwrap();
+                return Err((err, stream));
+            }
+        }
         let event = self.stream.as_mut().expect("polling TillDone twice").poll();
         match transform(event) {
             Ok(Async::Ready(Some(Ready::Item(value)))) => {
@@ -239,6 +254,7 @@ pub struct ItemsFlow<T, S, A> {
     what: PhantomData<T>,
     stream: S,
     answers: A,
+    first_next: bool,
 }
 
 impl<T, S, A> ItemsFlow<T, S, A>
@@ -250,6 +266,7 @@ impl<T, S, A> ItemsFlow<T, S, A>
             what: PhantomData,
             stream: s,
             answers: a,
+            first_next: true,
         }
     }
 }
@@ -263,6 +280,15 @@ impl<T, S, A> Stream for ItemsFlow<T, S, A>
     type Error = S::Error;
 
     fn poll(&mut self) -> Poll<Option<T>, S::Error> {
+        if self.first_next {
+            self.first_next = false;
+            let event = Event {
+                event: EventKind::Next,
+                data: None,
+            };
+            self.stream.start_send(event)?;
+            // TODO Consider to send `cancel` event
+        }
         let result = transform(self.stream.poll());
         match result {
             Ok(Async::NotReady) | Ok(Async::Ready(Some(Ready::NeedNext))) => {
