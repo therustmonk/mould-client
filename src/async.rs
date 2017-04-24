@@ -8,7 +8,7 @@ use futures::{Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSen
 use tokio_io::{AsyncRead, AsyncWrite};
 use tungstenite::Message;
 use tokio_tungstenite::{client_async, ConnectAsync, WebSocketStream};
-use super::{Event, EventKind, Error, ErrorKind, InteractionRequest, Request};
+use super::{Event, EventKind, Error, ErrorKind, InteractionRequest};
 
 pub fn mould_connect<S: AsyncRead + AsyncWrite>(url: Url, stream: S) -> Connecting<S> {
     Connecting {
@@ -87,6 +87,7 @@ impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
 }
 
 pub trait MouldStream {
+    /*
     fn items_flow<T, A>(self, answers: A) -> ItemsFlow<T, Self, A>
         where Self: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
               A: Stream<Item=Option<Request>, Error=Error>,
@@ -107,11 +108,13 @@ pub trait MouldStream {
     {
         TillDone::new(self)
     }
+    */
 
-    fn do_interaction<F, I, R, O>(self, request: InteractionRequest, f: F) -> DoInteraction<F, I, R, O, Self>
-        where R: IntoFuture, Self: Sized
+    fn do_interaction<T, F, I, R, O>(self, request: InteractionRequest, init: T, f: F) -> DoInteraction<T, F, I, R, O, Self>
+        where R: IntoFuture<Item=(T, Option<O>)>, Self: Sized,
+              F: FnMut((T, I)) -> R, Self: Sized,
     {
-        DoInteraction::new(self, request, f)
+        DoInteraction::new(self, init, request, f)
     }
 
 }
@@ -121,9 +124,10 @@ impl<S> MouldStream for S
 {
 }
 
-pub struct DoInteraction<F, I, R, O, S>
+pub struct DoInteraction<T, F, I, R, O, S>
     where R: IntoFuture
 {
+    fold: Option<T>,
     request: Option<InteractionRequest>,
     need_next: bool,
     stream: Option<S>,
@@ -133,11 +137,12 @@ pub struct DoInteraction<F, I, R, O, S>
     output: PhantomData<O>,
 }
 
-impl<F, I, R, O, S> DoInteraction<F, I, R, O, S>
+impl<T, F, I, R, O, S> DoInteraction<T, F, I, R, O, S>
     where R: IntoFuture
 {
-    pub fn new(s: S, i: InteractionRequest, f: F) -> Self {
+    pub fn new(s: S, init: T, i: InteractionRequest, f: F) -> Self {
         DoInteraction {
+            fold: Some(init),
             request: Some(i),
             need_next: true,
             stream: Some(s),
@@ -149,10 +154,10 @@ impl<F, I, R, O, S> DoInteraction<F, I, R, O, S>
     }
 }
 
-impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
+impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
     where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
-          F: FnMut(Option<I>) -> R, Self: Sized,
-          R: IntoFuture<Item=Option<O>, Error=S::Error>,
+          F: FnMut((T, I)) -> R, Self: Sized,
+          R: IntoFuture<Item=(T, Option<O>), Error=S::Error>,
           I: Deserialize,
           O: Serialize,
 {
@@ -176,7 +181,7 @@ impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
             }
         }
         let res = self.pending.as_mut().map(|fut| fut.poll());
-        if let Some(Ok(Async::Ready(value))) = res {
+        if let Some(Ok(Async::Ready((fold, value)))) = res {
             let value = value.to_json()?;
             let event = Event {
                 event: EventKind::Next,
@@ -184,6 +189,7 @@ impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
             };
             let sink = self.stream.as_mut().expect("polling DoInteraction twice");
             sink.start_send(event)?;
+            self.fold = Some(fold);
             self.pending = None;
             // No need to send `cancel`, because impossible
         }
@@ -196,8 +202,10 @@ impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
                             if let Some(data) = data {
                                 let res = serde_json::from_value(data);
                                 if let Ok(value) = res {
-                                    let fut = (self.f)(value).into_future();
-                                    self.pending = Some(fut);
+                                    if let Some(fold) = self.fold.take() {
+                                        let fut = (self.f)((fold, value)).into_future();
+                                        self.pending = Some(fut);
+                                    }
                                 } else {
                                     // TODO Send `cancel` event
                                     return Err(ErrorKind::UnexpectedFormat.into());
@@ -215,11 +223,12 @@ impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
                                     data: None,
                                 };
                                 stream.start_send(event)?;
+                                self.need_next = false;
                             } else {
                                 let res = self.pending.as_mut().map(|fut| {
                                     fut.poll()
                                 });
-                                if let Some(Ok(Async::Ready(value))) = res {
+                                if let Some(Ok(Async::Ready((fold, value)))) = res {
                                     let value = value.to_json()?;
                                     let event = Event {
                                         event: EventKind::Next,
@@ -227,6 +236,7 @@ impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
                                     };
                                     let sink = self.stream.as_mut().expect("polling DoInteraction twice");
                                     sink.start_send(event)?;
+                                    self.fold = Some(fold);
                                     self.pending = None;
                                     // No need to send `cancel`, because impossible
                                 }
@@ -259,6 +269,7 @@ impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
     }
 }
 
+/*
 pub struct StartInteraction<S> {
     request: Option<InteractionRequest>,
     stream: Option<S>,
@@ -549,3 +560,4 @@ impl<S, L, R> Future for Stright<S>
     }
 }
 
+*/
