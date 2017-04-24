@@ -4,7 +4,7 @@ use url::Url;
 use serde::de::Deserialize;
 use serde_json::Value;
 use serde_json::value::ToJson;
-use futures::{future, Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSend, BoxFuture};
+use futures::{Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSend};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tungstenite::Message;
 use tokio_tungstenite::{client_async, ConnectAsync, WebSocketStream};
@@ -83,93 +83,6 @@ impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
 
     fn poll_complete(&mut self) -> Poll<(), Error> {
         self.inner.poll_complete().map_err(|e| e.into())
-    }
-}
-
-impl<T> MouldTransport<T> where T: AsyncRead + AsyncWrite + Send + 'static {
-    /*
-    pub fn start_interaction(self, request: InteractionRequest) -> BoxFuture<Self, Error> {
-        let event = future::lazy(move || {
-            let event = Event {
-                event: EventKind::Request,
-                data: Some(request.to_json()?),
-            };
-            Ok(event)
-        });
-        event.and_then(move |event| {
-            self.send(event)
-        })
-        .boxed()
-    }
-
-    pub fn till_end(self) -> BoxFuture<Self, Error> {
-        self.into_future()
-            .map_err(|e| e.0)
-            .and_then(|(event, mould)| {
-                if let Some(Event { event, data }) = event {
-                    match event {
-                        EventKind::Done => {
-                            Ok(mould)
-                        },
-                        EventKind::Reject => {
-                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
-                            Err(ErrorKind::ActionRejected(reason.into()).into())
-                        },
-                        EventKind::Fail => {
-                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
-                            Err(ErrorKind::ActionFailed(reason.into()).into())
-                        },
-                        kind => {
-                            return Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into());
-                        },
-                    }
-                } else {
-                    Err(ErrorKind::Interrupted.into())
-                }
-            })
-            .boxed()
-    }
-    */
-
-    pub fn ready_next(self) -> BoxFuture<Self, Error> {
-        self.into_future()
-            .map_err(|e| e.0)
-            .and_then(|(evt, mould)| {
-                match evt {
-                    Some(Event { event: EventKind::Ready, .. }) => {
-                        mould.send(Event::empty(EventKind::Next))
-                            .boxed()
-                    },
-                    Some(event) => {
-                        future::err(ErrorKind::UnexpectedKind(format!("{:?}", event.event)).into())
-                            .boxed()
-                    },
-                    None => {
-                        future::err(ErrorKind::Interrupted.into())
-                            .boxed()
-                    },
-                }
-            })
-            .boxed()
-    }
-
-    pub fn recv_item(self) -> BoxFuture<(Value, Self), Error> {
-        self.into_future()
-            .map_err(|e| e.0)
-            .and_then(|(evt, mould)| {
-                match evt {
-                    Some(Event { event: EventKind::Item, data: Some(value) }) => {
-                        Ok((value, mould))
-                    },
-                    Some(event) => {
-                        Err(ErrorKind::UnexpectedKind(format!("{:?}", event.event)).into())
-                    },
-                    None => {
-                        Err(ErrorKind::Interrupted.into())
-                    },
-                }
-            })
-            .boxed()
     }
 }
 
