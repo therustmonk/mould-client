@@ -3,7 +3,7 @@ use serde_json;
 use url::Url;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
-use serde_json::value::ToJson;
+//use serde_json::value::ToJson;
 use futures::{Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSend};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tungstenite::Message;
@@ -158,7 +158,7 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
     where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
           F: FnMut((T, I)) -> R, Self: Sized,
           R: IntoFuture<Item=(T, Option<O>), Error=S::Error>,
-          I: Deserialize,
+          for<'de> I: Deserialize<'de>,
           O: Serialize,
 {
     type Item = S;
@@ -166,7 +166,7 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let Some(request) = self.request.take() {
-            match request.to_json() {
+            match serde_json::to_value(request) {
                 Ok(request) => {
                     let stream = self.stream.as_mut().expect("polling StartInteraction twice");
                     let event = Event {
@@ -182,7 +182,7 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
         }
         let res = self.pending.as_mut().map(|fut| fut.poll());
         if let Some(Ok(Async::Ready((fold, value)))) = res {
-            let value = value.to_json()?;
+            let value = serde_json::to_value(value)?;
             let event = Event {
                 event: EventKind::Next,
                 data: Some(value),
@@ -229,7 +229,7 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
                                     fut.poll()
                                 });
                                 if let Some(Ok(Async::Ready((fold, value)))) = res {
-                                    let value = value.to_json()?;
+                                    let value = serde_json::to_value(value)?;
                                     let event = Event {
                                         event: EventKind::Next,
                                         data: Some(value),

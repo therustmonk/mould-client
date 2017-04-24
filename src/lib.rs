@@ -18,7 +18,7 @@ use std::{fmt, io, str, result};
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
 use serde::de::{Visitor};
 use serde_json::{Map, Value};
-use serde_json::value::ToJson;
+//use serde_json::value::ToJson;
 use websocket::message::{Message, Type};
 
 error_chain! {
@@ -124,15 +124,15 @@ impl Serialize for EventKind {
     }
 }
 
-impl Deserialize for EventKind {
+impl<'de> Deserialize<'de> for EventKind {
     fn deserialize<D>(deserializer: D) -> result::Result<EventKind, D::Error>
-        where D: Deserializer
+        where D: Deserializer<'de>
     {
         struct FieldVisitor {
             min: usize,
         };
 
-        impl Visitor for FieldVisitor {
+        impl<'vi> Visitor<'vi> for FieldVisitor {
             type Value = EventKind;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -200,7 +200,7 @@ impl<S> Client<S>
     pub fn start_interaction(mut self, request: InteractionRequest) -> Result<BusyClient<S>> {
         let event = Event {
             event: EventKind::Request,
-            data: Some(request.to_json()?),
+            data: Some(serde_json::to_value(request)?),
         };
         let message = Message::text(serde_json::to_string(&event)?);
         self.inner.send_message(&message)?;
@@ -225,7 +225,7 @@ impl<S> BusyClient<S>
             return Err(ErrorKind::InteractionFinished.into());
         }
         let request = match request {
-            Some(request) => Some(request.to_json()?),
+            Some(request) => Some(serde_json::to_value(request)?),
             None => None,
         };
         let event = Event {
