@@ -130,6 +130,7 @@ pub struct DoInteraction<T, F, I, R, O, S>
     fold: Option<T>,
     request: Option<InteractionRequest>,
     need_next: bool,
+    is_done: bool,
     stream: Option<S>,
     f: F,
     pending: Option<R::Future>,
@@ -145,6 +146,7 @@ impl<T, F, I, R, O, S> DoInteraction<T, F, I, R, O, S>
             fold: Some(init),
             request: Some(i),
             need_next: true,
+            is_done: false,
             stream: Some(s),
             f: f,
             pending: None,
@@ -161,7 +163,7 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
           for<'de> I: Deserialize<'de>,
           O: Serialize,
 {
-    type Item = S;
+    type Item = (T, S);
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -182,16 +184,22 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
         }
         let res = self.pending.as_mut().map(|fut| fut.poll());
         if let Some(Ok(Async::Ready((fold, value)))) = res {
-            let value = serde_json::to_value(value)?;
-            let event = Event {
-                event: EventKind::Next,
-                data: Some(value),
-            };
-            let sink = self.stream.as_mut().expect("polling DoInteraction twice");
-            sink.start_send(event)?;
-            self.fold = Some(fold);
-            self.pending = None;
-            // No need to send `cancel`, because impossible
+            if self.is_done {
+                let stream = self.stream.take().unwrap();
+                let fold = self.fold.take().unwrap();
+                return Ok(Async::Ready((fold, stream)));
+            } else {
+                let value = serde_json::to_value(value)?;
+                let event = Event {
+                    event: EventKind::Next,
+                    data: Some(value),
+                };
+                let sink = self.stream.as_mut().expect("polling DoInteraction twice");
+                sink.start_send(event)?;
+                self.fold = Some(fold);
+                self.pending = None;
+                // No need to send `cancel`, because impossible
+            }
         }
         loop {
             let item = self.stream.as_mut().expect("polling DoInteraction twice").poll();
@@ -251,8 +259,27 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
                             return Err(ErrorKind::ActionFailed(reason.into()).into());
                         },
                         EventKind::Done => {
-                            let stream = self.stream.take().unwrap();
-                            return Ok(Async::Ready(stream));
+                            self.is_done = true;
+                            let res = self.pending.as_mut().map(|fut| {
+                                fut.poll()
+                            });
+                            match res {
+                                Some(Ok(Async::Ready((fold, _)))) => {
+                                    let stream = self.stream.take().unwrap();
+                                    return Ok(Async::Ready((fold, stream)));
+                                },
+                                Some(Ok(Async::NotReady)) => {
+                                    // Ignore...
+                                },
+                                Some(Err(err)) => {
+                                    return Err(err);
+                                },
+                                None => {
+                                    let stream = self.stream.take().unwrap();
+                                    let fold = self.fold.take().unwrap();
+                                    return Ok(Async::Ready((fold, stream)));
+                                },
+                            }
                         },
                         kind => {
                             // TODO Send `cancel` event
@@ -262,7 +289,8 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
                 },
                 None => {
                     let stream = self.stream.take().unwrap();
-                    return Ok(Async::Ready(stream));
+                    let fold = self.fold.take().unwrap();
+                    return Ok(Async::Ready((fold, stream)));
                 },
             }
         }
