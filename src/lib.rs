@@ -4,7 +4,7 @@ extern crate serde;
 #[macro_use] extern crate serde_derive;
 pub extern crate serde_json;
 pub extern crate websocket;
-extern crate futures;
+#[macro_use] extern crate futures;
 extern crate futures_state_stream;
 extern crate tokio_core;
 extern crate tokio_io;

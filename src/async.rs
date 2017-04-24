@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use serde_json;
 use url::Url;
-use serde::de::Deserialize;
+use serde::{Serialize, Deserialize};
 use serde_json::Value;
 use serde_json::value::ToJson;
 use futures::{Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSend};
@@ -108,11 +108,155 @@ pub trait MouldStream {
         TillDone::new(self)
     }
 
+    fn do_interaction<F, I, R, O>(self, request: InteractionRequest, f: F) -> DoInteraction<F, I, R, O, Self>
+        where R: IntoFuture, Self: Sized
+    {
+        DoInteraction::new(self, request, f)
+    }
+
 }
 
 impl<S> MouldStream for S
     where S: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
 {
+}
+
+pub struct DoInteraction<F, I, R, O, S>
+    where R: IntoFuture
+{
+    request: Option<InteractionRequest>,
+    need_next: bool,
+    stream: Option<S>,
+    f: F,
+    pending: Option<R::Future>,
+    input: PhantomData<I>,
+    output: PhantomData<O>,
+}
+
+impl<F, I, R, O, S> DoInteraction<F, I, R, O, S>
+    where R: IntoFuture
+{
+    pub fn new(s: S, i: InteractionRequest, f: F) -> Self {
+        DoInteraction {
+            request: Some(i),
+            need_next: true,
+            stream: Some(s),
+            f: f,
+            pending: None,
+            input: PhantomData,
+            output: PhantomData,
+        }
+    }
+}
+
+impl<F, I, R, O, S> Future for DoInteraction<F, I, R, O, S>
+    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+          F: FnMut(Option<I>) -> R, Self: Sized,
+          R: IntoFuture<Item=Option<O>, Error=S::Error>,
+          I: Deserialize,
+          O: Serialize,
+{
+    type Item = S;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        if let Some(request) = self.request.take() {
+            match request.to_json() {
+                Ok(request) => {
+                    let stream = self.stream.as_mut().expect("polling StartInteraction twice");
+                    let event = Event {
+                        event: EventKind::Request,
+                        data: Some(request),
+                    };
+                    stream.start_send(event)?;
+                },
+                Err(err) => {
+                    return Err(err.into());
+                },
+            }
+        }
+        let res = self.pending.as_mut().map(|fut| fut.poll());
+        if let Some(Ok(Async::Ready(value))) = res {
+            let value = value.to_json()?;
+            let event = Event {
+                event: EventKind::Next,
+                data: Some(value),
+            };
+            let sink = self.stream.as_mut().expect("polling DoInteraction twice");
+            sink.start_send(event)?;
+            self.pending = None;
+            // No need to send `cancel`, because impossible
+        }
+        loop {
+            let item = self.stream.as_mut().expect("polling DoInteraction twice").poll();
+            match try_ready!(item) {
+                Some(Event { event, data }) => {
+                    match event {
+                        EventKind::Item => {
+                            if let Some(data) = data {
+                                let res = serde_json::from_value(data);
+                                if let Ok(value) = res {
+                                    let fut = (self.f)(value).into_future();
+                                    self.pending = Some(fut);
+                                } else {
+                                    // TODO Send `cancel` event
+                                    return Err(ErrorKind::UnexpectedFormat.into());
+                                }
+                            } else {
+                                // TODO Send `cancel` event
+                                return Err(ErrorKind::NoDataProvided.into());
+                            }
+                        },
+                        EventKind::Ready => {
+                            if self.need_next {
+                                let stream = self.stream.as_mut().expect("polling StartInteraction twice");
+                                let event = Event {
+                                    event: EventKind::Next,
+                                    data: None,
+                                };
+                                stream.start_send(event)?;
+                            } else {
+                                let res = self.pending.as_mut().map(|fut| {
+                                    fut.poll()
+                                });
+                                if let Some(Ok(Async::Ready(value))) = res {
+                                    let value = value.to_json()?;
+                                    let event = Event {
+                                        event: EventKind::Next,
+                                        data: Some(value),
+                                    };
+                                    let sink = self.stream.as_mut().expect("polling DoInteraction twice");
+                                    sink.start_send(event)?;
+                                    self.pending = None;
+                                    // No need to send `cancel`, because impossible
+                                }
+                            }
+                        },
+                        EventKind::Reject => {
+                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
+                            return Err(ErrorKind::ActionRejected(reason.into()).into());
+                        },
+                        EventKind::Fail => {
+                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
+                            return Err(ErrorKind::ActionFailed(reason.into()).into());
+                        },
+                        EventKind::Done => {
+                            let stream = self.stream.take().unwrap();
+                            return Ok(Async::Ready(stream));
+                        },
+                        kind => {
+                            // TODO Send `cancel` event
+                            return Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into());
+                        },
+                    }
+                },
+                None => {
+                    let stream = self.stream.take().unwrap();
+                    return Ok(Async::Ready(stream));
+                },
+            }
+        }
+    }
 }
 
 pub struct StartInteraction<S> {
