@@ -161,23 +161,31 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
             }
         }
         let res = self.pending.as_mut().map(|fut| fut.poll());
-        if let Some(Ok(Async::Ready((fold, value)))) = res {
-            if self.is_done {
-                let stream = self.stream.take().unwrap();
-                let fold = self.fold.take().unwrap();
-                return Ok(Async::Ready((fold, stream)));
-            } else {
-                let value = serde_json::to_value(value)?;
-                let event = Event {
-                    event: EventKind::Next,
-                    data: Some(value),
-                };
-                let sink = self.stream.as_mut().expect("polling DoInteraction twice");
-                sink.start_send(event)?;
-                self.fold = Some(fold);
-                self.pending = None;
-                // No need to send `cancel`, because impossible
-            }
+        match res {
+            Some(Ok(Async::Ready((fold, value)))) => {
+                if self.is_done {
+                    let stream = self.stream.take().unwrap();
+                    let fold = self.fold.take().unwrap();
+                    return Ok(Async::Ready((fold, stream)));
+                } else {
+                    let value = serde_json::to_value(value)?;
+                    let event = Event {
+                        event: EventKind::Next,
+                        data: Some(value),
+                    };
+                    let sink = self.stream.as_mut().expect("polling DoInteraction twice");
+                    sink.start_send(event)?;
+                    self.fold = Some(fold);
+                    self.pending = None;
+                    // No need to send `cancel`, because impossible
+                }
+            },
+            None | Some(Ok(Async::NotReady)) => {
+            },
+            Some(Err(_)) => {
+                // TODO Send cancel
+                return Err(ErrorKind::Interrupted.into());
+            },
         }
         loop {
             let item = self.stream.as_mut().expect("polling DoInteraction twice").poll();
@@ -211,20 +219,26 @@ impl<T, F, I, R, O, S> Future for DoInteraction<T, F, I, R, O, S>
                                 stream.start_send(event)?;
                                 self.need_next = false;
                             } else {
-                                let res = self.pending.as_mut().map(|fut| {
-                                    fut.poll()
-                                });
-                                if let Some(Ok(Async::Ready((fold, value)))) = res {
-                                    let value = serde_json::to_value(value)?;
-                                    let event = Event {
-                                        event: EventKind::Next,
-                                        data: Some(value),
-                                    };
-                                    let sink = self.stream.as_mut().expect("polling DoInteraction twice");
-                                    sink.start_send(event)?;
-                                    self.fold = Some(fold);
-                                    self.pending = None;
-                                    // No need to send `cancel`, because impossible
+                                let res = self.pending.as_mut().map(|fut| fut.poll());
+                                match res {
+                                    Some(Ok(Async::Ready((fold, value)))) => {
+                                        let value = serde_json::to_value(value)?;
+                                        let event = Event {
+                                            event: EventKind::Next,
+                                            data: Some(value),
+                                        };
+                                        let sink = self.stream.as_mut().expect("polling DoInteraction twice");
+                                        sink.start_send(event)?;
+                                        self.fold = Some(fold);
+                                        self.pending = None;
+                                        // No need to send `cancel`, because impossible
+                                    },
+                                    None | Some(Ok(Async::NotReady)) => {
+                                    },
+                                    Some(Err(_)) => {
+                                        // TODO Send cancel
+                                        return Err(ErrorKind::Interrupted.into());
+                                    },
                                 }
                             }
                         },
