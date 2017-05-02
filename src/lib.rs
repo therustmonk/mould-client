@@ -308,11 +308,16 @@ pub trait MouldFlow {
         }
     }
 
-    /*
-    fn last_item(self) -> LastItem
+    fn last_item<B, I>(self) -> LastItem<Self, B, I>
+        where Self: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
+              Self: Sized,
     {
+        LastItem {
+            stream: Some(self),
+            origin: PhantomData,
+            item: None,
+        }
     }
-    */
 
     fn fold_flow<S, B, T, F, R, I, O>(self, init: T, f: F) -> FoldFlow<Self, B, T, F, R>
         where R: IntoFuture<Item=(S, O)>,
@@ -331,6 +336,43 @@ pub trait MouldFlow {
 }
 
 impl<S, R, I, O> MouldFlow for Interaction<S, R, I, O> {
+}
+
+pub struct LastItem<S, B, I>
+{
+    stream: Option<S>,
+    origin: PhantomData<B>,
+    item: Option<I>,
+}
+
+impl<S, B, I> Future for LastItem<S, B, I>
+    where S: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
+{
+    type Item = (Option<I>, B);
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
+            let value = try_ready!(item);
+            match value {
+                Some((value, false)) => {
+                    self.item = Some(value);
+                    let sink = self.stream.as_mut().expect("polling FoldFlow twice");
+                    sink.start_send(())?;
+                },
+                Some((item, true)) => {
+                    let stream = self.stream.take().unwrap().origin();
+                    return Ok(Async::Ready((Some(item), stream)));
+                },
+                None => {
+                    let item = self.item.take();
+                    let stream = self.stream.take().unwrap().origin();
+                    return Ok(Async::Ready((item, stream)));
+                },
+            }
+        }
+    }
 }
 
 pub struct TillDone<S, B>
