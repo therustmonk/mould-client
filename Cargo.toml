@@ -16,3 +16,4 @@ tokio-io = "0.1.1"
 tungstenite = "0.2.0"
 tokio-tungstenite = { git = "https://github.com/snapview/tokio-tungstenite" }
 url = "1.4.0"
+mould = {  git = "https://github.com/DenisKolodin/mould" }

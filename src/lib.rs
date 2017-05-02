@@ -10,6 +10,7 @@ extern crate tokio_io;
 extern crate tungstenite;
 extern crate tokio_tungstenite;
 extern crate url;
+extern crate mould;
 
 use std::{fmt, io, str, result};
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
@@ -21,6 +22,7 @@ use futures::{Future, IntoFuture, Async, AsyncSink, Poll, Stream, Sink, StartSen
 use tokio_io::{AsyncRead, AsyncWrite};
 use tungstenite::Message;
 use tokio_tungstenite::{client_async, ConnectAsync, WebSocketStream};
+use mould::session::{Input, Output};
 
 
 error_chain! {
@@ -62,34 +64,6 @@ error_chain! {
     }
 }
 
-type TaskId = usize;
-
-#[derive(Serialize)]
-#[serde(tag = "event", content = "data", rename_all = "lowercase")]
-pub enum Input {
-    Request {
-        service: String,
-        action: String,
-        payload: Value,
-    },
-    Next(Value),
-    Suspend,
-    Resume(TaskId),
-    Cancel,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "event", content = "data", rename_all = "lowercase")]
-pub enum Output {
-    Ready,
-    Item(Value),
-    Done,
-    Reject(String),
-    Fail(String),
-    Suspended(TaskId),
-}
-
-#[derive(Serialize)]
 pub struct InteractionRequest<R> {
     pub service: String,
     pub action: String,
