@@ -62,108 +62,32 @@ error_chain! {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Event {
-    pub event: EventKind,
-    pub data: Option<Value>,
-}
+type TaskId = usize;
 
-impl Event {
-    pub fn is_terminated(&self) -> bool {
-        use EventKind::*;
-        match self.event {
-            Done | Fail | Reject => true,
-            _ => false,
-        }
-    }
-
-    pub fn is_ready(&self) -> bool {
-        use EventKind::*;
-        match self.event {
-            Ready => true,
-            _ => false,
-        }
-    }
-
-    pub fn empty(kind: EventKind) -> Self {
-        Event {
-            event: kind,
-            data: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum EventKind {
-    Request,
-    Ready,
-    Item,
-    Next,
-    Reject,
-    Fail,
-    Done,
+#[derive(Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "lowercase")]
+pub enum Input {
+    Request {
+        service: String,
+        action: String,
+        payload: Value,
+    },
+    Next(Value),
+    Suspend,
+    Resume(TaskId),
     Cancel,
-    Suspended,
 }
 
-impl Serialize for EventKind {
-    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
-        where S: Serializer
-    {
-        let kind = match *self {
-            EventKind::Request => "request",
-            EventKind::Ready => "ready",
-            EventKind::Item => "item",
-            EventKind::Next => "next",
-            EventKind::Reject => "reject",
-            EventKind::Fail => "fail",
-            EventKind::Done => "done",
-            EventKind::Cancel => "cancel",
-            EventKind::Suspended => "suspended",
-        };
-        serializer.serialize_str(kind)
-    }
+#[derive(Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "lowercase")]
+pub enum Output {
+    Ready,
+    Item(Value),
+    Done,
+    Reject(String),
+    Fail(String),
+    Suspended(TaskId),
 }
-
-impl<'de> Deserialize<'de> for EventKind {
-    fn deserialize<D>(deserializer: D) -> result::Result<EventKind, D::Error>
-        where D: Deserializer<'de>
-    {
-        struct FieldVisitor {
-            min: usize,
-        };
-
-        impl<'vi> Visitor<'vi> for FieldVisitor {
-            type Value = EventKind;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "a string containing at least {} bytes", self.min)
-            }
-
-            fn visit_str<E>(self, value: &str) -> result::Result<EventKind, E>
-                where E: serde::de::Error
-            {
-                let kind = match value {
-                    "request" => EventKind::Request,
-                    "ready" => EventKind::Ready,
-                    "item" => EventKind::Item,
-                    "next" => EventKind::Next,
-                    "reject" => EventKind::Reject,
-                    "fail" => EventKind::Fail,
-                    "done" => EventKind::Done,
-                    "cancel" => EventKind::Cancel,
-                    "suspended" => EventKind::Suspended,
-                    s => {
-                        return Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(s), &self));
-                    },
-                };
-                Ok(kind)
-            }
-        }
-        deserializer.deserialize_str(FieldVisitor { min: 4 })
-    }
-}
-
 
 #[derive(Serialize)]
 pub struct InteractionRequest<R> {
@@ -209,7 +133,7 @@ impl<S> MouldTransport<S> {
 }
 
 impl<T> Stream for MouldTransport<T> where T: AsyncRead + AsyncWrite {
-    type Item = Event;
+    type Item = Output;
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -235,11 +159,11 @@ impl<T> Stream for MouldTransport<T> where T: AsyncRead + AsyncWrite {
 }
 
 impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
-    type SinkItem = Event;
+    type SinkItem = Input;
     type SinkError = Error;
 
-    fn start_send(&mut self, event: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let text = serde_json::to_string(&event)?;
+    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        let text = serde_json::to_string(&item)?;
         let message = Message::Text(text);
         self.inner.start_send(message)?; // Put to a send queue
         Ok(AsyncSink::Ready)
@@ -270,23 +194,16 @@ impl<S, R, I, O> Origin<S> for BeginInteraction<S, R, I, O> {
 }
 
 impl<S, R, I, O> Sink for BeginInteraction<S, R, I, O>
-    where S: Sink<SinkItem=Event, SinkError=Error>,
+    where S: Sink<SinkItem=Input, SinkError=Error>,
           O: Serialize,
 {
-    type SinkItem = Option<O>;
+    type SinkItem = O;
     type SinkError = Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         if let Some(ref mut stream) = self.stream {
-            let data = {
-                if let Some(item) = item {
-                    Some(serde_json::to_value(&item)?)
-                } else {
-                    None
-                }
-            };
-            let event = EventKind::Next;
-            stream.start_send(Event { event, data })?; // Put to a send queue
+            let data = serde_json::to_value(&item)?;
+            stream.start_send(Input::Next(data))?; // Put to a send queue
             Ok(AsyncSink::Ready)
         } else {
             Ok(AsyncSink::NotReady(item))
@@ -303,7 +220,7 @@ impl<S, R, I, O> Sink for BeginInteraction<S, R, I, O>
 }
 
 impl<S, R, I, O> Stream for BeginInteraction<S, R, I, O>
-    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+    where S: Stream<Item=Output, Error=Error> + Sink<SinkItem=Input, SinkError=Error>,
           R: Serialize,
           for <'de> I: Deserialize<'de>,
 {
@@ -314,52 +231,37 @@ impl<S, R, I, O> Stream for BeginInteraction<S, R, I, O>
         if self.done {
             return Ok(Async::Ready(None));
         }
-        if let Some(request) = self.request.take() {
-            let request = serde_json::to_value(request)?;
-            let stream = self.stream.as_mut().expect("polling StartInteraction twice");
-            let event = Event {
-                event: EventKind::Request,
-                data: Some(request),
-            };
-            stream.start_send(event)?;
+        if let Some(InteractionRequest { service, action, payload }) = self.request.take() {
+            let payload = serde_json::to_value(payload)?;
+            let sink = self.stream.as_mut().expect("polling StartInteraction twice");
+            sink.start_send(Input::Request { service, action, payload })?;
         }
         loop {
             let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
             match try_ready!(item) {
-                Some(Event { event, data }) => {
-                    match event {
-                        EventKind::Item => {
-                            if let Some(data) = data {
-                                let item = serde_json::from_value(data)?;
-                                self.item = Some(item);
-                            } else {
-                                return Err("take item twice".into());
-                            }
+                Some(output) => {
+                    match output {
+                        Output::Item(data) => {
+                            let item = serde_json::from_value(data)?;
+                            self.item = Some(item);
                         },
-                        EventKind::Ready => {
+                        Output::Ready => {
                             if let Some(item) = self.item.take() {
                                 return Ok(Async::Ready(Some((item, false))));
                             } else {
-                                let event = Event {
-                                    event: EventKind::Next,
-                                    data: None,
-                                };
                                 let sink = self.stream.as_mut().expect("polling FoldFlow twice");
-                                sink.start_send(event)?;
-                                //return Err("no item taken".into());
+                                sink.start_send(Input::Next(Value::Null))?;
                             }
                         },
-                        EventKind::Reject => {
+                        Output::Reject(reason) => {
                             self.done = true;
-                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
-                            return Err(ErrorKind::ActionRejected(reason.into()).into());
+                            return Err(ErrorKind::ActionRejected(reason).into());
                         },
-                        EventKind::Fail => {
+                        Output::Fail(reason) => {
                             self.done = true;
-                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
-                            return Err(ErrorKind::ActionFailed(reason.into()).into());
+                            return Err(ErrorKind::ActionFailed(reason).into());
                         },
-                        EventKind::Done => {
+                        Output::Done => {
                             self.done = true;
                             if let Some(item) = self.item.take() {
                                 return Ok(Async::Ready(Some((item, true))));
@@ -367,9 +269,8 @@ impl<S, R, I, O> Stream for BeginInteraction<S, R, I, O>
                                 return Ok(Async::Ready(None));
                             }
                         },
-                        kind => {
-                            // TODO Send `cancel` event
-                            return Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into());
+                        Output::Suspended(_) => {
+                            return Err("task suspending not supported".into());
                         },
                     }
                 },
@@ -414,40 +315,86 @@ pub trait MouldStream {
 
 
 impl<S> MouldStream for S
-    where S: Sized + Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
+    where S: Sized + Stream<Item=Output, Error=Error> + Sink<SinkItem=Input, SinkError=Error>,
 {
 }
 
 pub trait MouldFlow {
-    fn fold_flow<S, X, T, F, R, I, O>(self, init: T, f: F) -> FoldFlow<Self, X, T, F, R>
+
+    // TODO one_item
+    // TODO all_items
+
+    fn till_done<B>(self) -> TillDone<Self, B>
+        where Self: Stream<Item=((), Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
+              Self: Sized,
+    {
+        TillDone {
+            stream: Some(self),
+            origin: PhantomData,
+        }
+    }
+
+    fn fold_flow<S, B, T, F, R, I, O>(self, init: T, f: F) -> FoldFlow<Self, B, T, F, R>
         where R: IntoFuture<Item=(S, O)>,
               F: FnMut((T, I)) -> R,
               Self: Sized,
     {
         FoldFlow {
-            fold: Some(init),
             stream: Some(self),
+            origin: PhantomData,
+            fold: Some(init),
             pending: None,
             f: f,
-            origin: PhantomData,
             done: false,
         }
     }
 }
 
-impl<S, I, O> MouldFlow for S
-    where S: Sized + Stream<Item=I, Error=Error> + Sink<SinkItem=O, SinkError=Error>,
-{
+impl<S, R, I, O> MouldFlow for BeginInteraction<S, R, I, O> {
 }
 
-pub struct FoldFlow<S, X, T, F, R>
+/*
+impl<S, I, O> MouldFlow for S
+    where S: Sized + Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=O, SinkError=Error>,
+{
+}
+*/
+
+pub struct TillDone<S, B>
+{
+    stream: Option<S>,
+    origin: PhantomData<B>,
+}
+
+impl<S, B> Future for TillDone<S, B>
+    where S: Stream<Item=((), Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
+{
+    type Item = B;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
+            let value = try_ready!(item);
+            if let Some((_, false)) = value {
+                let sink = self.stream.as_mut().expect("polling FoldFlow twice");
+                sink.start_send(())?;
+            } else {
+                let stream = self.stream.take().unwrap().origin();
+                return Ok(Async::Ready(stream));
+            }
+        }
+    }
+}
+
+pub struct FoldFlow<S, B, T, F, R>
     where R: IntoFuture,
 {
-    fold: Option<T>,
     stream: Option<S>,
+    origin: PhantomData<B>,
+    fold: Option<T>,
     pending: Option<R::Future>,
     f: F,
-    origin: PhantomData<X>,
     done: bool,
 }
 
@@ -455,12 +402,12 @@ type Last = bool;
 
 /// Option<I> - None if last
 /// Option<O> - None if last
-impl<S, X, T, F, R, I, O> Future for FoldFlow<S, X, T, F, R>
-    where S: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=O, SinkError=Error> + Origin<X>,
+impl<S, B, T, F, R, I, O> Future for FoldFlow<S, B, T, F, R>
+    where S: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=O, SinkError=Error> + Origin<B>,
           F: FnMut((T, I)) -> R, Self: Sized,
           R: IntoFuture<Item=(T, O), Error=S::Error>,
 {
-    type Item = (T, X);
+    type Item = (T, B);
     type Error = Error; // TODO Repair the stream
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -474,6 +421,9 @@ impl<S, X, T, F, R, I, O> Future for FoldFlow<S, X, T, F, R>
                             let sink = self.stream.as_mut().expect("polling FoldFlow twice");
                             sink.start_send(res)?;
                         } else {
+                            // TODO Consider to fire an error
+                            // because this interaction process must expect response for every
+                            // question!!!!!!!!!!!!!
                             break;
                         }
                     },
