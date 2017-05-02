@@ -1,8 +1,7 @@
 #[macro_use] extern crate log;
 #[macro_use] extern crate error_chain;
 extern crate serde;
-#[macro_use] extern crate serde_derive;
-pub extern crate serde_json;
+extern crate serde_json;
 #[macro_use] extern crate futures;
 extern crate futures_state_stream;
 extern crate tokio_core;
@@ -12,9 +11,8 @@ extern crate tokio_tungstenite;
 extern crate url;
 extern crate mould;
 
-use std::{fmt, io, str, result};
-use serde::{Serialize, Serializer, Deserialize, Deserializer};
-use serde::de::{Visitor};
+use std::{io, str};
+use serde::{Serialize, Deserialize};
 use serde_json::Value;
 use std::marker::PhantomData;
 use url::Url;
@@ -112,8 +110,9 @@ impl<T> Stream for MouldTransport<T> where T: AsyncRead + AsyncWrite {
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         match self.inner.poll() {
-            Ok(Async::Ready(Some(Message::Text(ref text)))) => {
-                let event = serde_json::from_str(text)?;
+            Ok(Async::Ready(Some(Message::Text(ref content)))) => {
+                debug!("Recv <= {:?}", content);
+                let event = serde_json::from_str(content)?;
                 Ok(Async::Ready(Some(event)))
             },
             Ok(Async::Ready(None)) => {
@@ -137,8 +136,9 @@ impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
     type SinkError = Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let text = serde_json::to_string(&item)?;
-        let message = Message::Text(text);
+        let content = serde_json::to_string(&item)?;
+        debug!("Send => {:?}", content);
+        let message = Message::Text(content);
         self.inner.start_send(message)?; // Put to a send queue
         Ok(AsyncSink::Ready)
     }
