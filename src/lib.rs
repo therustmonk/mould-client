@@ -22,7 +22,6 @@ use tungstenite::Message;
 use tokio_tungstenite::{client_async, ConnectAsync, WebSocketStream};
 use mould::session::{Input, Output};
 
-
 error_chain! {
     foreign_links {
         IoError(io::Error);
@@ -62,13 +61,13 @@ error_chain! {
     }
 }
 
+type Last = bool;
+
 pub struct MouldRequest<R> {
     pub service: String,
     pub action: String,
     pub payload: R,
 }
-
-//pub type Request = Value;
 
 pub fn mould_connect<S: AsyncRead + AsyncWrite>(url: Url, stream: S) -> Connecting<S> {
     Connecting {
@@ -202,16 +201,17 @@ impl<S, R, I, O> Stream for Interaction<S, R, I, O>
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        const FAIL: &str = "polling Interaction twice";
         if self.done {
             return Ok(Async::Ready(None));
         }
         if let Some(MouldRequest { service, action, payload }) = self.request.take() {
             let payload = serde_json::to_value(payload)?;
-            let sink = self.stream.as_mut().expect("polling StartInteraction twice");
+            let sink = self.stream.as_mut().expect(FAIL);
             sink.start_send(Input::Request { service, action, payload })?;
         }
         loop {
-            let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
+            let item = self.stream.as_mut().expect(FAIL).poll();
             match try_ready!(item) {
                 Some(output) => {
                     match output {
@@ -223,7 +223,7 @@ impl<S, R, I, O> Stream for Interaction<S, R, I, O>
                             if let Some(item) = self.item.take() {
                                 return Ok(Async::Ready(Some((item, false))));
                             } else {
-                                let sink = self.stream.as_mut().expect("polling FoldFlow twice");
+                                let sink = self.stream.as_mut().expect(FAIL);
                                 sink.start_send(Input::Next(Value::Null))?;
                             }
                         },
@@ -271,22 +271,7 @@ pub trait MouldStream {
         }
     }
 
-    /*
-    fn do_interaction<T, F, I, R, O, D>(self, service: String, action: String, data: D, init: T, f: F) -> Result<FoldFlow<T, F, I, R, O, Self>>
-        where R: IntoFuture<Item=(T, Option<O>)>, Self: Sized,
-              F: FnMut((T, I)) -> R, Self: Sized,
-              D: Serialize
-    {
-        // TODO Making interaction request
-        let payload = serde_json::to_value(data)?;
-        let request = MouldRequest { service, action, payload };
-        Ok(FoldFlow::new(self, init, request, f))
-    }
-    */
-
 }
-
-
 
 impl<S> MouldStream for S
     where S: Sized + Stream<Item=Output, Error=Error> + Sink<SinkItem=Input, SinkError=Error>,
@@ -294,9 +279,6 @@ impl<S> MouldStream for S
 }
 
 pub trait MouldFlow {
-
-    // TODO one_item
-    // TODO all_items
 
     fn till_done<B>(self) -> TillDone<Self, B>
         where Self: Stream<Item=((), Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
@@ -319,6 +301,17 @@ pub trait MouldFlow {
         }
     }
 
+    fn all_items<B, I>(self) -> AllItems<Self, B, I>
+        where Self: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
+              Self: Sized,
+    {
+        AllItems {
+            stream: Some(self),
+            origin: PhantomData,
+            items: Some(Vec::new()),
+        }
+    }
+
     fn fold_flow<S, B, T, F, R, I, O>(self, init: T, f: F) -> FoldFlow<Self, B, T, F, R>
         where R: IntoFuture<Item=(S, O)>,
               F: FnMut((T, I)) -> R,
@@ -338,6 +331,46 @@ pub trait MouldFlow {
 impl<S, R, I, O> MouldFlow for Interaction<S, R, I, O> {
 }
 
+pub struct AllItems<S, B, I>
+{
+    stream: Option<S>,
+    origin: PhantomData<B>,
+    items: Option<Vec<I>>,
+}
+
+impl<S, B, I> Future for AllItems<S, B, I>
+    where S: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=(), SinkError=Error> + Origin<B>,
+{
+    type Item = (Vec<I>, B);
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        const FAIL: &str = "polling AllItems twice";
+        loop {
+            let item = self.stream.as_mut().expect(FAIL).poll();
+            let value = try_ready!(item);
+            match value {
+                Some((item, false)) => {
+                    self.items.as_mut().expect(FAIL).push(item);
+                    let sink = self.stream.as_mut().expect(FAIL);
+                    sink.start_send(())?;
+                },
+                Some((item, true)) => {
+                    let mut items = self.items.take().expect(FAIL);
+                    items.push(item);
+                    let stream = self.stream.take().unwrap().origin();
+                    return Ok(Async::Ready((items, stream)));
+                },
+                None => {
+                    let items = self.items.take().expect(FAIL);
+                    let stream = self.stream.take().unwrap().origin();
+                    return Ok(Async::Ready((items, stream)));
+                },
+            }
+        }
+    }
+}
+
 pub struct LastItem<S, B, I>
 {
     stream: Option<S>,
@@ -352,13 +385,14 @@ impl<S, B, I> Future for LastItem<S, B, I>
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        const FAIL: &str = "polling LastItem twice";
         loop {
-            let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
+            let item = self.stream.as_mut().expect(FAIL).poll();
             let value = try_ready!(item);
             match value {
-                Some((value, false)) => {
-                    self.item = Some(value);
-                    let sink = self.stream.as_mut().expect("polling FoldFlow twice");
+                Some((item, false)) => {
+                    self.item = Some(item);
+                    let sink = self.stream.as_mut().expect(FAIL);
                     sink.start_send(())?;
                 },
                 Some((item, true)) => {
@@ -388,11 +422,12 @@ impl<S, B> Future for TillDone<S, B>
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        const FAIL: &str = "polling TillDone twice";
         loop {
-            let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
+            let item = self.stream.as_mut().expect(FAIL).poll();
             let value = try_ready!(item);
             if let Some((_, false)) = value {
-                let sink = self.stream.as_mut().expect("polling FoldFlow twice");
+                let sink = self.stream.as_mut().expect(FAIL);
                 sink.start_send(())?;
             } else {
                 let stream = self.stream.take().unwrap().origin();
@@ -413,10 +448,6 @@ pub struct FoldFlow<S, B, T, F, R>
     done: bool,
 }
 
-type Last = bool;
-
-/// Option<I> - None if last
-/// Option<O> - None if last
 impl<S, B, T, F, R, I, O> Future for FoldFlow<S, B, T, F, R>
     where S: Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=O, SinkError=Error> + Origin<B>,
           F: FnMut((T, I)) -> R, Self: Sized,
@@ -426,6 +457,7 @@ impl<S, B, T, F, R, I, O> Future for FoldFlow<S, B, T, F, R>
     type Error = Error; // TODO Repair the stream
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        const FAIL: &str = "polling FoldFlow twice";
         loop {
             if self.pending.is_some() {
                 match self.pending.as_mut().unwrap().poll() {
@@ -433,7 +465,7 @@ impl<S, B, T, F, R, I, O> Future for FoldFlow<S, B, T, F, R>
                         self.fold = Some(fold);
                         self.pending = None;
                         if !self.done {
-                            let sink = self.stream.as_mut().expect("polling FoldFlow twice");
+                            let sink = self.stream.as_mut().expect(FAIL);
                             sink.start_send(res)?;
                         } else {
                             // TODO Consider to fire an error
@@ -451,7 +483,7 @@ impl<S, B, T, F, R, I, O> Future for FoldFlow<S, B, T, F, R>
                     },
                 }
             } else {
-                let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
+                let item = self.stream.as_mut().expect(FAIL).poll();
                 let value = try_ready!(item);
                 if let Some((value, last)) = value {
                     self.done = last;
@@ -469,192 +501,3 @@ impl<S, B, T, F, R, I, O> Future for FoldFlow<S, B, T, F, R>
     }
 }
 
-/*
-pub struct FoldFlow<T, F, I, R, O, S>
-    where R: IntoFuture
-{
-    fold: Option<T>,
-    request: Option<MouldRequest>,
-    need_next: bool,
-    is_done: bool,
-    stream: Option<S>,
-    f: F,
-    pending: Option<R::Future>,
-    input: PhantomData<I>,
-    output: PhantomData<O>,
-}
-
-impl<T, F, I, R, O, S> FoldFlow<T, F, I, R, O, S>
-    where R: IntoFuture
-{
-    fn new(s: S, init: T, i: MouldRequest, f: F) -> Self {
-        FoldFlow {
-            fold: Some(init),
-            request: Some(i),
-            need_next: true,
-            is_done: false,
-            stream: Some(s),
-            f: f,
-            pending: None,
-            input: PhantomData,
-            output: PhantomData,
-        }
-    }
-}
-
-impl<T, F, I, R, O, S> Future for FoldFlow<T, F, I, R, O, S>
-    where S: Stream<Item=Event, Error=Error> + Sink<SinkItem=Event, SinkError=Error>,
-          F: FnMut((T, I)) -> R, Self: Sized,
-          R: IntoFuture<Item=(T, Option<O>), Error=S::Error>,
-          for<'de> I: Deserialize<'de>,
-          O: Serialize,
-{
-    type Item = (T, S);
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Some(request) = self.request.take() {
-            match serde_json::to_value(request) {
-                Ok(request) => {
-                    let stream = self.stream.as_mut().expect("polling StartInteraction twice");
-                    let event = Event {
-                        event: EventKind::Request,
-                        data: Some(request),
-                    };
-                    stream.start_send(event)?;
-                },
-                Err(err) => {
-                    return Err(err.into());
-                },
-            }
-        }
-        let res = self.pending.as_mut().map(|fut| fut.poll());
-        match res {
-            Some(Ok(Async::Ready((fold, value)))) => {
-                if self.is_done {
-                    let stream = self.stream.take().unwrap();
-                    let fold = self.fold.take().unwrap();
-                    return Ok(Async::Ready((fold, stream)));
-                } else {
-                    let value = serde_json::to_value(value)?;
-                    let event = Event {
-                        event: EventKind::Next,
-                        data: Some(value),
-                    };
-                    let sink = self.stream.as_mut().expect("polling FoldFlow twice");
-                    sink.start_send(event)?;
-                    self.fold = Some(fold);
-                    self.pending = None;
-                    // No need to send `cancel`, because impossible
-                }
-            },
-            None | Some(Ok(Async::NotReady)) => {
-            },
-            Some(Err(_)) => {
-                // TODO Send cancel
-                return Err(ErrorKind::Interrupted.into());
-            },
-        }
-        loop {
-            let item = self.stream.as_mut().expect("polling FoldFlow twice").poll();
-            match try_ready!(item) {
-                Some(Event { event, data }) => {
-                    trace!("Event {:?} received with data {:?}", event, data);
-                    match event {
-                        EventKind::Item => {
-                            if let Some(data) = data {
-                                let res = serde_json::from_value(data);
-                                if let Ok(value) = res {
-                                    if let Some(fold) = self.fold.take() {
-                                        let fut = (self.f)((fold, value)).into_future();
-                                        self.pending = Some(fut);
-                                    }
-                                } else {
-                                    // TODO Send `cancel` event
-                                    return Err(ErrorKind::UnexpectedFormat.into());
-                                }
-                            } else {
-                                // TODO Send `cancel` event
-                                return Err(ErrorKind::NoDataProvided.into());
-                            }
-                        },
-                        EventKind::Ready => {
-                            if self.need_next {
-                                let stream = self.stream.as_mut().expect("polling StartInteraction twice");
-                                let event = Event {
-                                    event: EventKind::Next,
-                                    data: None,
-                                };
-                                stream.start_send(event)?;
-                                self.need_next = false;
-                            } else {
-                                let res = self.pending.as_mut().map(|fut| fut.poll());
-                                match res {
-                                    Some(Ok(Async::Ready((fold, value)))) => {
-                                        let value = serde_json::to_value(value)?;
-                                        let event = Event {
-                                            event: EventKind::Next,
-                                            data: Some(value),
-                                        };
-                                        let sink = self.stream.as_mut().expect("polling FoldFlow twice");
-                                        sink.start_send(event)?;
-                                        self.fold = Some(fold);
-                                        self.pending = None;
-                                        // No need to send `cancel`, because impossible
-                                    },
-                                    None | Some(Ok(Async::NotReady)) => {
-                                    },
-                                    Some(Err(_)) => {
-                                        // TODO Send cancel
-                                        return Err(ErrorKind::Interrupted.into());
-                                    },
-                                }
-                            }
-                        },
-                        EventKind::Reject => {
-                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no reject reason>");
-                            return Err(ErrorKind::ActionRejected(reason.into()).into());
-                        },
-                        EventKind::Fail => {
-                            let reason = data.as_ref().and_then(Value::as_str).unwrap_or("<no fail reason>");
-                            return Err(ErrorKind::ActionFailed(reason.into()).into());
-                        },
-                        EventKind::Done => {
-                            self.is_done = true;
-                            let res = self.pending.as_mut().map(|fut| {
-                                fut.poll()
-                            });
-                            match res {
-                                Some(Ok(Async::Ready((fold, _)))) => {
-                                    let stream = self.stream.take().unwrap();
-                                    return Ok(Async::Ready((fold, stream)));
-                                },
-                                Some(Ok(Async::NotReady)) => {
-                                    // Ignore...
-                                },
-                                Some(Err(err)) => {
-                                    return Err(err);
-                                },
-                                None => {
-                                    let stream = self.stream.take().unwrap();
-                                    let fold = self.fold.take().unwrap();
-                                    return Ok(Async::Ready((fold, stream)));
-                                },
-                            }
-                        },
-                        kind => {
-                            // TODO Send `cancel` event
-                            return Err(ErrorKind::UnexpectedKind(format!("{:?}", kind)).into());
-                        },
-                    }
-                },
-                None => {
-                    let stream = self.stream.take().unwrap();
-                    let fold = self.fold.take().unwrap();
-                    return Ok(Async::Ready((fold, stream)));
-                },
-            }
-        }
-    }
-}
-*/
