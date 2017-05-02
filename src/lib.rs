@@ -62,13 +62,13 @@ error_chain! {
     }
 }
 
-pub struct InteractionRequest<R> {
+pub struct MouldRequest<R> {
     pub service: String,
     pub action: String,
     pub payload: R,
 }
 
-pub type Request = Value;
+//pub type Request = Value;
 
 pub fn mould_connect<S: AsyncRead + AsyncWrite>(url: Url, stream: S) -> Connecting<S> {
     Connecting {
@@ -149,8 +149,8 @@ impl<T> Sink for MouldTransport<T> where T: AsyncRead + AsyncWrite {
 }
 
 // Sink I, Stream O
-pub struct BeginInteraction<S, R, I, O> {
-    request: Option<InteractionRequest<R>>,
+pub struct Interaction<S, R, I, O> {
+    request: Option<MouldRequest<R>>,
     item: Option<I>,
     output: PhantomData<O>,
     stream: Option<S>,
@@ -161,13 +161,13 @@ pub trait Origin<S> {
     fn origin(self) -> S;
 }
 
-impl<S, R, I, O> Origin<S> for BeginInteraction<S, R, I, O> {
+impl<S, R, I, O> Origin<S> for Interaction<S, R, I, O> {
     fn origin(mut self) -> S {
         self.stream.take().unwrap()
     }
 }
 
-impl<S, R, I, O> Sink for BeginInteraction<S, R, I, O>
+impl<S, R, I, O> Sink for Interaction<S, R, I, O>
     where S: Sink<SinkItem=Input, SinkError=Error>,
           O: Serialize,
 {
@@ -193,7 +193,7 @@ impl<S, R, I, O> Sink for BeginInteraction<S, R, I, O>
     }
 }
 
-impl<S, R, I, O> Stream for BeginInteraction<S, R, I, O>
+impl<S, R, I, O> Stream for Interaction<S, R, I, O>
     where S: Stream<Item=Output, Error=Error> + Sink<SinkItem=Input, SinkError=Error>,
           R: Serialize,
           for <'de> I: Deserialize<'de>,
@@ -205,7 +205,7 @@ impl<S, R, I, O> Stream for BeginInteraction<S, R, I, O>
         if self.done {
             return Ok(Async::Ready(None));
         }
-        if let Some(InteractionRequest { service, action, payload }) = self.request.take() {
+        if let Some(MouldRequest { service, action, payload }) = self.request.take() {
             let payload = serde_json::to_value(payload)?;
             let sink = self.stream.as_mut().expect("polling StartInteraction twice");
             sink.start_send(Input::Request { service, action, payload })?;
@@ -258,11 +258,11 @@ impl<S, R, I, O> Stream for BeginInteraction<S, R, I, O>
 
 pub trait MouldStream {
 
-    fn start_interaction<R, I, O>(self, request: InteractionRequest<R>)
-        -> BeginInteraction<Self, R, I, O>
+    fn start_interaction<R, I, O>(self, request: MouldRequest<R>)
+        -> Interaction<Self, R, I, O>
         where Self: Sized, R: Serialize, for <'de> I: Deserialize<'de>, O: Serialize,
     {
-        BeginInteraction {
+        Interaction {
             request: Some(request),
             item: None,
             output: PhantomData,
@@ -279,7 +279,7 @@ pub trait MouldStream {
     {
         // TODO Making interaction request
         let payload = serde_json::to_value(data)?;
-        let request = InteractionRequest { service, action, payload };
+        let request = MouldRequest { service, action, payload };
         Ok(FoldFlow::new(self, init, request, f))
     }
     */
@@ -308,6 +308,12 @@ pub trait MouldFlow {
         }
     }
 
+    /*
+    fn last_item(self) -> LastItem
+    {
+    }
+    */
+
     fn fold_flow<S, B, T, F, R, I, O>(self, init: T, f: F) -> FoldFlow<Self, B, T, F, R>
         where R: IntoFuture<Item=(S, O)>,
               F: FnMut((T, I)) -> R,
@@ -324,15 +330,8 @@ pub trait MouldFlow {
     }
 }
 
-impl<S, R, I, O> MouldFlow for BeginInteraction<S, R, I, O> {
+impl<S, R, I, O> MouldFlow for Interaction<S, R, I, O> {
 }
-
-/*
-impl<S, I, O> MouldFlow for S
-    where S: Sized + Stream<Item=(I, Last), Error=Error> + Sink<SinkItem=O, SinkError=Error>,
-{
-}
-*/
 
 pub struct TillDone<S, B>
 {
@@ -433,7 +432,7 @@ pub struct FoldFlow<T, F, I, R, O, S>
     where R: IntoFuture
 {
     fold: Option<T>,
-    request: Option<InteractionRequest>,
+    request: Option<MouldRequest>,
     need_next: bool,
     is_done: bool,
     stream: Option<S>,
@@ -446,7 +445,7 @@ pub struct FoldFlow<T, F, I, R, O, S>
 impl<T, F, I, R, O, S> FoldFlow<T, F, I, R, O, S>
     where R: IntoFuture
 {
-    fn new(s: S, init: T, i: InteractionRequest, f: F) -> Self {
+    fn new(s: S, init: T, i: MouldRequest, f: F) -> Self {
         FoldFlow {
             fold: Some(init),
             request: Some(i),
