@@ -43,10 +43,6 @@ error_chain! {
         Interrupted {
             description("connection interrupted")
         }
-        ActionRejected(s: String) {
-            description("action rejected")
-            display("action rejected: '{}'", s)
-        }
         ActionFailed(s: String) {
             description("action failed")
             display("action failed: '{}'", s)
@@ -226,10 +222,6 @@ impl<S, R, I, O> Stream for Interaction<S, R, I, O>
                                 let sink = self.stream.as_mut().expect(FAIL);
                                 sink.start_send(Input::Next(Value::Null))?;
                             }
-                        },
-                        Output::Reject(reason) => {
-                            self.done = true;
-                            return Err(ErrorKind::ActionRejected(reason).into());
                         },
                         Output::Fail(reason) => {
                             self.done = true;
